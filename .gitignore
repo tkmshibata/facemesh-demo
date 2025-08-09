@@ -1,0 +1,9 @@
+# Python/Streamlitで不要なもの
+__pycache__/
+*.pyc
+*.pyo
+*.DS_Store
+.env
+.venv/
+.vscode/
+.streamlit/cache/
