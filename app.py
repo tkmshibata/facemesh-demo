@@ -76,8 +76,14 @@ if uploaded:
                     cv2.circle(annotated, (x, y),
                                pts_accent.circle_radius,
                                pts_accent.color, -1)
+        ###↓追記8/26###
+        # NumPy → PIL に変換
+        final_image = Image.fromarray(annotated)
+        # ✅ PIL 画像で表示（これでエラー回避）
+        st.image(final_image, caption="Custom drawn landmarks", use_container_width=True)
+        ###↑追記###
 
-        st.image(annotated, caption="Custom drawn landmarks",
-                 use_container_width=True)
+
+        #st.image(annotated, caption="Custom drawn landmarks",use_container_width=True)
     else:
         st.error("顔を検出できませんでした")
