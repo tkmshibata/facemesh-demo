@@ -3,3 +3,7 @@ mediapipe==0.10.21
 opencv-python-headless==4.10.0.82
 numpy==1.26.4
 pillow==11.3.0
+
+# ---- 追加で安定化する依存関係 ----
+protobuf<5
+attrs<24
