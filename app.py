@@ -1,12 +1,3 @@
-# app.py
-# ランドマーク検出 × 黄金比/白銀比（回転補正 → 顔トリミング後に描画）
-# ・顔を目の水平で回転補正
-# ・顔外周からトリミング（余白あり）
-# ・黄金比(φ) / 白銀比(√2) のオーバーレイ画像を2枚作成し、UIで切り替え
-# ・三分割は「眉 ↔ 鼻下」区間を1/3等分基準（理想）で表示
-# ・表に「顔H/W」「眉↔鼻下の三分割」「目間隔/片目幅」「鼻幅/口幅」を表示
-# ※Streamlit 1.46系、mediapipe 0.10系、opencv-python-headless で動作想定
-
 import math
 from typing import Dict, Tuple, List
 import cv2
@@ -17,17 +8,12 @@ import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2 as mp_landmark
 import pandas as pd
 
-# -------------------- ページ設定 --------------------
-st.set_page_config(page_title="顔 × 黄金比/白銀比 比較", page_icon="📐", layout="centered")
+# ============== ページ設定 & UI最小化 ==============
+st.set_page_config(page_title="顔 × 黄金比/白銀比（三分割MVP）", page_icon="📐", layout="centered")
 st.markdown("<style>#MainMenu,header,footer{visibility:hidden;}</style>", unsafe_allow_html=True)
-st.title("ランドマーク検出 × 黄金比 / 白銀比")
+st.title("ランドマーク検出 × 黄金比 / 白銀比（眉↔鼻下を基準に三分割）")
 
-st.caption(
-    "顔を自動で水平に補正・トリミングし、黄金比(φ≈1.618) / 白銀比(√2≈1.414)の理想枠と、"
-    "「眉 ↔ 鼻下」の三分割（1/3等分）を重ねて比較します。"
-)
-
-# -------------------- MediaPipe 初期化（キャッシュ） --------------------
+# ============== MediaPipe（キャッシュ） ==============
 @st.cache_resource
 def get_facemesh():
     return mp.solutions.face_mesh.FaceMesh(
@@ -41,7 +27,19 @@ mp_face = mp.solutions.face_mesh
 mp_draw = mp.solutions.drawing_utils
 face_mesh = get_facemesh()
 
-# -------------------- ユーティリティ --------------------
+# ============== 定数とユーティリティ ==============
+PHI = (1 + 5**0.5) / 2.0          # 1.618...
+SILVER = 2 ** 0.5                 # 1.414...
+
+# よく使うランドマーク
+IDX = dict(
+    R_E_OUT=33, R_E_IN=133, L_E_IN=362, L_E_OUT=263,  # 目
+    M_R=61, M_L=291,                                  # 口角
+    NOSE_L=97, NOSE_R=326,                            # 鼻翼端（鼻下の近似に利用）
+    CHIN=152,                                         # 顎先
+    BROW_R_UP=105, BROW_L_UP=334                      # 眉上の代表点
+)
+
 def pil2np(img: Image.Image) -> np.ndarray:
     return np.array(img.convert("RGB"))
 
@@ -55,7 +53,6 @@ def face_oval_indices() -> List[int]:
     return sorted({i for pair in mp_face.FACEMESH_FACE_OVAL for i in pair})
 
 def dashed_line(img, pt1, pt2, color, thickness=2, dash=12, gap=8):
-    """OpenCV で破線（アンチエイリアス）"""
     p1 = np.array(pt1, dtype=float); p2 = np.array(pt2, dtype=float)
     length = np.linalg.norm(p2 - p1)
     if length < 1: return
@@ -66,110 +63,119 @@ def dashed_line(img, pt1, pt2, color, thickness=2, dash=12, gap=8):
         e = p1 + ((dash + gap) * i + dash) * v
         cv2.line(img, tuple(s.astype(int)), tuple(e.astype(int)), color, thickness, lineType=cv2.LINE_AA)
 
-# -------------------- 代表ランドマーク（MediaPipe idx） --------------------
-IDX = dict(
-    R_E_OUT=33,   # 右目 外側
-    R_E_IN=133,   # 右目 内側
-    L_E_IN=362,   # 左目 内側
-    L_E_OUT=263,  # 左目 外側
-    M_R=61,       # 口 右
-    M_L=291,      # 口 左
-    NOSE_L=97,    # 鼻翼 左端 近似
-    NOSE_R=326,   # 鼻翼 右端 近似
-    CHIN=152,     # 顎 先端
-    FOREHEAD=10,  # 額上部 近似（髪際ではない）
-    BROW_R_UP=105,# 右眉 上方の点
-    BROW_L_UP=334,# 左眉 上方の点
-)
+# ============== 整列（目の水平化）& 切り出し ==============
+def align_rotate(img_rgb: np.ndarray, xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """目の中心線が水平になるよう回転。画像と点群を回転。"""
+    h, w, _ = img_rgb.shape
+    re_c = (xy[IDX["R_E_OUT"]] + xy[IDX["R_E_IN"]]) / 2.0
+    le_c = (xy[IDX["L_E_OUT"]] + xy[IDX["L_E_IN"]]) / 2.0
+    dy, dx = (le_c[1] - re_c[1]), (le_c[0] - re_c[0])
+    angle = math.degrees(math.atan2(dy, dx))
+    center = (w/2.0, h/2.0)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
 
-# -------------------- 指標計算（※三分割は「眉 ↔ 鼻下」区間） --------------------
-def compute_metrics(xy: np.ndarray) -> Dict[str, float]:
-    # 顔外周（幅・高さ・H/W）
+    rot = cv2.warpAffine(img_rgb, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    ones = np.ones((xy.shape[0], 1))
+    xy_h = np.hstack([xy, ones])
+    xy_rot = (M @ xy_h.T).T
+    return rot, xy_rot
+
+def compute_keylines_from_rotated(xy_rot: np.ndarray) -> Dict[str, float]:
+    """回転後の座標から、三分割に使うキーポイントyを求める。"""
+    # 眉：代表2点の平均y
+    brow_y = (xy_rot[IDX["BROW_R_UP"]][1] + xy_rot[IDX["BROW_L_UP"]][1]) / 2.0
+    # 鼻下：鼻翼端(左右)の中点y
+    nose_base_y = (xy_rot[IDX["NOSE_L"]][1] + xy_rot[IDX["NOSE_R"]][1]) / 2.0
+    # 顎先
+    chin_y = xy_rot[IDX["CHIN"]][1]
+    # 生え際（近似）：顔外輪郭の最上点
+    oval = face_oval_indices()
+    hairline_y = float(np.min(xy_rot[oval][:, 1]))
+    return dict(brow_y=brow_y, nose_base_y=nose_base_y, chin_y=chin_y, hairline_y=hairline_y)
+
+def compute_crop_box(xy_rot: np.ndarray, img_shape, key: Dict[str, float], extra_margin=0.18) -> Tuple[int,int,int,int]:
+    """顔外輪郭と“理想線（生え際=眉-1, 顎=鼻下+1）”が入るようにトリミング範囲を決定。"""
+    h, w = img_shape[:2]
+    oval = face_oval_indices()
+    pts = xy_rot[oval]
+    x1, y1 = float(np.min(pts[:,0])), float(np.min(pts[:,1]))
+    x2, y2 = float(np.max(pts[:,0])), float(np.max(pts[:,1]))
+
+    base = key["nose_base_y"] - key["brow_y"]  # 眉→鼻下（基準=1）
+    ideal_top = key["brow_y"] - base          # 理想の生え際ライン
+    ideal_bottom = key["nose_base_y"] + base  # 理想の顎先ライン
+
+    # 追加で、理想線も収まるように
+    y1 = min(y1, ideal_top)
+    y2 = max(y2, ideal_bottom)
+
+    # 余白を追加
+    bw, bh = (x2 - x1), (y2 - y1)
+    x1 -= bw * extra_margin; x2 += bw * extra_margin
+    y1 -= bh * extra_margin; y2 += bh * extra_margin
+
+    # 画面内にクリップ
+    x1i = int(max(0, round(x1))); y1i = int(max(0, round(y1)))
+    x2i = int(min(w-1, round(x2))); y2i = int(min(h-1, round(y2)))
+    return x1i, y1i, x2i, y2i
+
+def crop_with_box(img_rot: np.ndarray, xy_rot: np.ndarray, box: Tuple[int,int,int,int]) -> Tuple[np.ndarray, np.ndarray]:
+    x1,y1,x2,y2 = box
+    crop = img_rot[y1:y2, x1:x2].copy()
+    xy_crop = xy_rot.copy()
+    xy_crop[:,0] -= x1; xy_crop[:,1] -= y1
+    return crop, xy_crop
+
+# ============== 計測 & 表用の指標 ==============
+def compute_metrics_on_crop(xy: np.ndarray) -> Dict[str, float]:
+    """切り出し後の座標で各種指標を算出。"""
+    # 顔幅/高さ（外輪郭）
     oval = face_oval_indices()
     pts = xy[oval]
-    left  = tuple(pts[pts[:,0].argmin()])
+    left = tuple(pts[pts[:,0].argmin()])
     right = tuple(pts[pts[:,0].argmax()])
-    top   = tuple(pts[pts[:,1].argmin()])
-    bottom= tuple(pts[pts[:,1].argmax()])
-    face_w = dist(left, right)
-    face_h = dist(top, bottom)
+    top = tuple(pts[pts[:,1].argmin()])
+    bottom = tuple(pts[pts[:,1].argmax()])
+    face_w = dist(left, right); face_h = dist(top, bottom)
     face_AR = face_h / face_w if face_w > 1e-6 else np.nan
 
-    # 目：幅／中心間隔
+    # 三分割のキー
+    brow_y = (xy[IDX["BROW_R_UP"]][1] + xy[IDX["BROW_L_UP"]][1]) / 2.0
+    nose_base_y = (xy[IDX["NOSE_L"]][1] + xy[IDX["NOSE_R"]][1]) / 2.0
+    chin_y = xy[IDX["CHIN"]][1]
+    # 生え際：外輪郭最上点
+    hairline_y = float(np.min(pts[:,1]))
+
+    # 長さ（下方向が+）
+    L_top = brow_y - hairline_y
+    L_mid = nose_base_y - brow_y
+    L_bot = chin_y - nose_base_y
+
+    # 目：片目幅 & 目中心間
     re_w = dist(xy[IDX["R_E_OUT"]], xy[IDX["R_E_IN"]])
     le_w = dist(xy[IDX["L_E_OUT"]], xy[IDX["L_E_IN"]])
     eye_w = (re_w + le_w) / 2.0
     re_c = (xy[IDX["R_E_OUT"]] + xy[IDX["R_E_IN"]]) / 2.0
     le_c = (xy[IDX["L_E_OUT"]] + xy[IDX["L_E_IN"]]) / 2.0
     interocular = dist(re_c, le_c)
-    eye_spacing_ratio = interocular / eye_w if eye_w > 1e-6 else np.nan
+    eye_spacing_ratio = interocular / eye_w if eye_w>1e-6 else np.nan  # 理想=1
 
-    # 鼻幅 / 口幅（要件に合わせ「鼻幅/口幅」）
-    nose_w  = dist(xy[IDX["NOSE_L"]], xy[IDX["NOSE_R"]])
-    mouth_w = dist(xy[IDX["M_R"]],   xy[IDX["M_L"]])
-    nose_to_mouth = nose_w / mouth_w if mouth_w > 1e-6 else np.nan
-
-    # 三分割の区間端：眉ライン（左右眉上の平均y）↔ 鼻下（鼻翼左右の平均y）
-    brow_y = (xy[IDX["BROW_R_UP"]][1] + xy[IDX["BROW_L_UP"]][1]) / 2.0
-    nose_base_y = (xy[IDX["NOSE_L"]][1] + xy[IDX["NOSE_R"]][1]) / 2.0
-    segment_h = (nose_base_y - brow_y)  # 下向きが+（画像座標）
+    # 鼻幅/口幅（参考）
+    nose_w = dist(xy[IDX["NOSE_L"]], xy[IDX["NOSE_R"]])
+    mouth_w = dist(xy[IDX["M_R"]], xy[IDX["M_L"]])
+    nose_to_mouth = nose_w / mouth_w if mouth_w>1e-6 else np.nan
 
     return dict(
         face_w=face_w, face_h=face_h, face_AR=face_AR,
-        eye_spacing_ratio=eye_spacing_ratio,
-        nose_to_mouth=nose_to_mouth,
-        brow_y=brow_y, nose_base_y=nose_base_y, segment_h=segment_h
+        hairline_y=hairline_y, brow_y=brow_y, nose_base_y=nose_base_y, chin_y=chin_y,
+        L_top=L_top, L_mid=L_mid, L_bot=L_bot,
+        eye_spacing_ratio=eye_spacing_ratio, nose_to_mouth=nose_to_mouth
     )
 
-# -------------------- 回転補正 & 顔トリミング --------------------
-def align_and_crop(img_rgb: np.ndarray, xy: np.ndarray, margin=0.18) -> Tuple[np.ndarray, np.ndarray]:
-    """目の水平で回転→外周BBoxで切り出し（余白あり）→座標も変換"""
-    h, w, _ = img_rgb.shape
-    # 目の中心で角度
-    re_c = (xy[IDX["R_E_OUT"]] + xy[IDX["R_E_IN"]]) / 2.0
-    le_c = (xy[IDX["L_E_OUT"]] + xy[IDX["L_E_IN"]]) / 2.0
-    dy, dx = (le_c[1] - re_c[1]), (le_c[0] - re_c[0])
-    angle_deg = math.degrees(math.atan2(dy, dx))
-    center = (w/2.0, h/2.0)
-
-    # 画像回転
-    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
-    rot = cv2.warpAffine(img_rgb, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-    # 点群回転
-    ones = np.ones((xy.shape[0], 1))
-    xy_h = np.hstack([xy, ones])
-    xy_rot = (M @ xy_h.T).T  # (N,2)
-
-    # 顔外周からBBox
-    oval = face_oval_indices()
-    pts = xy_rot[oval]
-    x1, y1 = np.min(pts, axis=0)
-    x2, y2 = np.max(pts, axis=0)
-    # 余白
-    w0, h0 = x2-x1, y2-y1
-    x1 -= w0*margin; x2 += w0*margin
-    y1 -= h0*margin; y2 += h0*margin
-    x1 = int(max(0, x1)); y1 = int(max(0, y1))
-    x2 = int(min(w-1, x2)); y2 = int(min(h-1, y2))
-
-    crop = rot[y1:y2, x1:x2].copy()
-    xy_crop = xy_rot.copy()
-    xy_crop[:,0] -= x1; xy_crop[:,1] -= y1
-    return crop, xy_crop
-
-# -------------------- オーバーレイ（crop後に描画） --------------------
-PHI = (1 + 5**0.5) / 2.0
-SILVER = 2 ** 0.5
-
+# ============== オーバーレイ生成 ==============
 def build_overlay(crop: np.ndarray, xy: np.ndarray, target_ratio: float, label: str) -> np.ndarray:
-    """
-    回転・トリミング後の画像にすべて描画。
-    ・薄いメッシュ
-    ・緑：実測の顔外接枠
-    ・赤/青：理想の縦横比枠（黄金/白銀）
-    ・「眉 ↔ 鼻下」区間の三分割：理想（破線）＋端ライン（実線）
-    """
+    """回転・トリミング後の画像に、黄金/白銀の枠＋三分割（理想1:1:1 & 実測端）を描画。"""
     out = crop.copy()
     h, w, _ = out.shape
 
@@ -183,75 +189,98 @@ def build_overlay(crop: np.ndarray, xy: np.ndarray, target_ratio: float, label: 
         connection_drawing_spec=mp_draw.DrawingSpec(color=(210,210,210), thickness=1, circle_radius=0)
     )
 
-    # 顔実測枠（緑）
+    # 顔の外接枠（緑）
     oval = face_oval_indices()
     pts = xy[oval]
-    x1, y1 = pts[:,0].min(), pts[:,1].min()
-    x2, y2 = pts[:,0].max(), pts[:,1].max()
-    x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
-    cv2.rectangle(out, (x1i,y1i), (x2i,y2i), (0,255,0), 2, lineType=cv2.LINE_AA)
+    x1, y1 = int(np.min(pts[:,0])), int(np.min(pts[:,1]))
+    x2, y2 = int(np.max(pts[:,0])), int(np.max(pts[:,1]))
+    cv2.rectangle(out, (x1,y1), (x2,y2), (0,255,0), 2, lineType=cv2.LINE_AA)
 
-    # ターゲット枠（黄金/白銀）
-    width = x2i - x1i
-    cx = (x1i + x2i)//2
-    target_h = int(width * target_ratio)
-    ymid = (y1i + y2i)//2
-    ty1 = max(0, ymid - target_h//2)
-    ty2 = min(h-1, ymid + target_h//2)
+    # 黄金/白銀の枠（中央合わせ）…幅×比率
+    width = x2 - x1
+    cx = (x1 + x2)//2
+    t_h = int(width * target_ratio)
+    ymid = (y1 + y2)//2
+    ty1 = max(0, ymid - t_h//2)
+    ty2 = min(h-1, ymid + t_h//2)
     tx1 = max(0, cx - width//2)
     tx2 = min(w-1, cx + width//2)
-    color = (0,0,255) if label=="SILVER" else (255,0,0)
-    cv2.rectangle(out, (tx1,ty1), (tx2,ty2), color, 2, lineType=cv2.LINE_AA)
+    col = (0,0,255) if label=="SILVER" else (255,0,0)
+    cv2.rectangle(out, (tx1,ty1), (tx2,ty2), col, 2, lineType=cv2.LINE_AA)
 
-    # 眉 ↔ 鼻下 の三分割
+    # —— 三分割（眉↔鼻下を1、1:1:1になる理想線 + 実測端） ——
     brow_y = int((xy[IDX["BROW_R_UP"]][1] + xy[IDX["BROW_L_UP"]][1]) / 2.0)
-    nose_base_y = int((xy[IDX["NOSE_L"]][1] + xy[IDX["NOSE_R"]][1]) / 2.0)
-    topY, botY = min(brow_y, nose_base_y), max(brow_y, nose_base_y)
-    seg_h = botY - topY
+    nose_y = int((xy[IDX["NOSE_L"]][1] + xy[IDX["NOSE_R"]][1]) / 2.0)
+    base = max(1, nose_y - brow_y)  # ピクセル基準（0除算回避）
 
-    # 理想（1/3等分）…破線（ターゲット色）
-    if seg_h > 4:
-        for i in (1,2):
-            y = int(topY + (seg_h/3)*i)
-            dashed_line(out, (x1i, y), (x2i, y), color, thickness=2, dash=16, gap=10)
+    # 理想の生え際/顎先（眉±base）
+    ideal_hair = int(brow_y - base)
+    ideal_chin = int(nose_y + base)
 
-    # 実測端ライン（眉・鼻下）…実線（緑）
-    cv2.line(out, (x1i, brow_y),      (x2i, brow_y),      (0,255,0), 2, lineType=cv2.LINE_AA)
-    cv2.line(out, (x1i, nose_base_y), (x2i, nose_base_y), (0,255,0), 2, lineType=cv2.LINE_AA)
+    # 理想線（破線：ターゲット色）
+    dashed_line(out, (x1, ideal_hair), (x2, ideal_hair), col, thickness=2, dash=18, gap=12)
+    dashed_line(out, (x1, ideal_chin), (x2, ideal_chin), col, thickness=2, dash=18, gap=12)
+
+    # 実測の端：生え際（外輪郭最上）と顎先（実線：緑）
+    hairline = int(np.min(pts[:,1]))
+    chin = int(xy[IDX["CHIN"]][1])
+    cv2.line(out, (x1, hairline), (x2, hairline), (0,255,0), 2, lineType=cv2.LINE_AA)
+    cv2.line(out, (x1, chin), (x2, chin), (0,255,0), 2, lineType=cv2.LINE_AA)
+
+    # 眉と鼻下（実線：緑）
+    cv2.line(out, (x1, brow_y), (x2, brow_y), (0,255,0), 2, lineType=cv2.LINE_AA)
+    cv2.line(out, (x1, nose_y), (x2, nose_y), (0,255,0), 2, lineType=cv2.LINE_AA)
 
     # ラベル
     tag = "白銀比 √2" if label=="SILVER" else "黄金比 φ"
-    cv2.rectangle(out, (tx1, max(0,ty1-28)), (tx1+140, max(0,ty1-4)), color, -1)
+    cv2.rectangle(out, (tx1, max(0,ty1-28)), (tx1+150, max(0,ty1-4)), col, -1)
     cv2.putText(out, tag, (tx1+6, max(0,ty1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
 
     return out
 
-# -------------------- テーブル作成 --------------------
+# ============== テーブル生成（比率計算） ==============
 def build_table(metrics: Dict[str,float], target_ratio: float, target_name: str) -> pd.DataFrame:
-    # 顔 H/W と理想の差
+    # 顔 H/W と φ/√2 の誤差
     face_ar = metrics["face_AR"]
     err_ar = (face_ar - target_ratio) / target_ratio * 100 if np.isfinite(face_ar) else np.nan
 
-    # 三分割（眉↔鼻下）：理想は各 1/3
-    # 現段階では中間線の“実測点”がないため、写真値は区間を3等分とみなす（= 1/3）。
-    # 将来的に中間解剖点（例：目中心列/上口唇点 等）を採用すれば置換可能。
-    thirds_photo = [1/3, 1/3, 1/3]
-    thirds_err = [0.0, 0.0, 0.0]
+    # 三分割（生え際→眉 / 眉→鼻下 / 鼻下→顎先）を、(眉→鼻下)で正規化
+    L_top, L_mid, L_bot = metrics["L_top"], metrics["L_mid"], metrics["L_bot"]
+    def nz(v): return float(v) if np.isfinite(v) else np.nan
+    if L_mid and L_mid > 1e-6:
+        r_top = nz(L_top / L_mid)
+        r_mid = 1.0
+        r_bot = nz(L_bot / L_mid)
+        e_top = (r_top - 1.0) * 100 if np.isfinite(r_top) else np.nan
+        e_mid = 0.0
+        e_bot = (r_bot - 1.0) * 100 if np.isfinite(r_bot) else np.nan
+    else:
+        r_top = r_mid = r_bot = e_top = e_mid = e_bot = np.nan
+
+    # 目間隔/片目幅（理想=1）
+    eye_ratio = metrics["eye_spacing_ratio"]
+    eye_err = (eye_ratio - 1.0) * 100 if np.isfinite(eye_ratio) else np.nan
+
+    # 鼻幅/口幅（参考）
+    nose_to_mouth = metrics["nose_to_mouth"]
 
     rows = [
         {"項目":"顔の縦/横 (H/W)", "写真値":round(face_ar,3) if np.isfinite(face_ar) else None,
          "理想値":f"{target_name}={round(target_ratio,3)}", "差分%":round(err_ar,2) if np.isfinite(err_ar) else None},
-        {"項目":"上段（眉→1/3）/ 区間(眉↔鼻下)", "写真値":round(thirds_photo[0],3), "理想値":"1/3", "差分%":round(thirds_err[0],2)},
-        {"項目":"中段（1/3→2/3）/ 区間(眉↔鼻下)", "写真値":round(thirds_photo[1],3), "理想値":"1/3", "差分%":round(thirds_err[1],2)},
-        {"項目":"下段（2/3→鼻下）/ 区間(眉↔鼻下)", "写真値":round(thirds_photo[2],3), "理想値":"1/3", "差分%":round(thirds_err[2],2)},
-        {"項目":"目間隔/片目幅", "写真値":round(metrics["eye_spacing_ratio"],3) if np.isfinite(metrics["eye_spacing_ratio"]) else None,
-         "理想値":"参考: ≈1.0", "差分%":None},
-        {"項目":"鼻幅/口幅", "写真値":round(metrics["nose_to_mouth"],3) if np.isfinite(metrics["nose_to_mouth"]) else None,
-         "理想値":"参考: 個人差", "差分%":None},
+        {"項目":"(生え際→眉) / (眉→鼻下)", "写真値":round(r_top,3) if np.isfinite(r_top) else None,
+         "理想値":"1", "差分%":round(e_top,2) if np.isfinite(e_top) else None},
+        {"項目":"(眉→鼻下) / (眉→鼻下)", "写真値":round(r_mid,3) if np.isfinite(r_mid) else None,
+         "理想値":"1", "差分%":round(e_mid,2) if np.isfinite(e_mid) else None},
+        {"項目":"(鼻下→顎先) / (眉→鼻下)", "写真値":round(r_bot,3) if np.isfinite(r_bot) else None,
+         "理想値":"1", "差分%":round(e_bot,2) if np.isfinite(e_bot) else None},
+        {"項目":"目間隔/片目幅", "写真値":round(eye_ratio,3) if np.isfinite(eye_ratio) else None,
+         "理想値":"1", "差分%":round(eye_err,2) if np.isfinite(eye_err) else None},
+        {"項目":"鼻幅/口幅", "写真値":round(nose_to_mouth,3) if np.isfinite(nose_to_mouth) else None,
+         "理想値":"参考", "差分%":None},
     ]
     return pd.DataFrame(rows)
 
-# -------------------- UI 本体 --------------------
+# ============== アプリ本体 ==============
 uploaded = st.file_uploader("画像をアップロード（JPG/PNG）", type=["jpg","jpeg","png"])
 if not uploaded:
     st.stop()
@@ -259,40 +288,47 @@ if not uploaded:
 img = Image.open(uploaded).convert("RGB")
 np_img = pil2np(img)
 
-# 大きすぎる画像は先に縮小（処理軽量化）
+# 大きすぎる画像は先に縮小（処理と描画のバランス）
 long_edge = max(np_img.shape[:2])
-if long_edge > 1600:
-    scale = 1600 / long_edge
+if long_edge > 1800:
+    scale = 1800 / long_edge
     np_img = cv2.resize(np_img, (int(np_img.shape[1]*scale), int(np_img.shape[0]*scale)))
 
-# 顔検出
+# FaceMesh 推論
 res = face_mesh.process(np_img)
 if not res.multi_face_landmarks:
-    st.error("顔を検出できませんでした（正面に近い・明るい画像でお試しください）。")
+    st.error("顔を検出できませんでした。正面に近い・明るい画像でお試しください。")
     st.stop()
 
 landmarks = res.multi_face_landmarks[0].landmark
 h, w, _ = np_img.shape
 xy = landmarks_to_xy(landmarks, w, h)
 
-# 回転補正 & 顔トリミング（ここまでは描画しない）
-crop, xy_crop = align_and_crop(np_img, xy, margin=0.18)
+# 1) 回転
+rot_img, xy_rot = align_rotate(np_img, xy)
 
-# 指標
-metrics = compute_metrics(xy_crop)
+# 2) 三分割のキー（回転座標系）
+keys = compute_keylines_from_rotated(xy_rot)
 
-# 黄金比 / 白銀比のオーバーレイ画像を先に2枚作っておく
+# 3) そのキーを含むようにトリミングBOX決定 → 切り出し
+box = compute_crop_box(xy_rot, rot_img.shape, keys, extra_margin=0.18)
+crop, xy_crop = crop_with_box(rot_img, xy_rot, box)
+
+# 4) 指標計算（切り出し座標で）
+metrics = compute_metrics_on_crop(xy_crop)
+
+# 5) オーバーレイ画像（黄金/白銀）を事前生成
 img_golden = build_overlay(crop, xy_crop, PHI, "GOLDEN")
 img_silver = build_overlay(crop, xy_crop, SILVER, "SILVER")
 
-# 切替UI（画像と表が同期して切り替わる）
-mode = st.segmented_control("比較対象", options=["黄金比", "白銀比"], default="黄金比")
+# 6) 切替UI（画像と表が同期）
+mode = st.segmented_control("比較対象（画像・表ともに切替）", options=["黄金比", "白銀比"], default="黄金比")
 if mode == "黄金比":
     target_ratio, target_name, show_img = PHI, "φ", img_golden
 else:
     target_ratio, target_name, show_img = SILVER, "√2", img_silver
 
-st.subheader("結果オーバーレイ（回転補正 & 顔トリミング後に描画）")
+st.subheader("結果オーバーレイ（回転補正 & 切り出し後）")
 st.image(Image.fromarray(show_img), use_container_width=True)
 
 st.subheader("比率の比較表")
@@ -300,6 +336,6 @@ df = build_table(metrics, target_ratio, target_name)
 st.dataframe(df, use_container_width=True)
 
 st.caption(
-    "三分割は「眉 ↔ 鼻下」の区間を 1/3 等分とする理想線（破線）で表示しています。"
-    "将来的に中間解剖点（例：目中心列や上口唇点）を用いれば “実測の三分点” による評価へ拡張できます。"
+    "三分割は『生え際→眉』『眉→鼻下』『鼻下→顎先』が1:1:1（眉↔鼻下を基準1）。"
+    "黄金比(1:1.618)・白銀比(1:1.4)は全体H/Wの参照比として使用。数値は目安であり、個人差・文化差があります。"
 )
