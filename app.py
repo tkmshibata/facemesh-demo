@@ -213,12 +213,12 @@ def build_table(metrics: Dict[str,float], target_ratio: float, target_name: str)
     thirds_err = [ (t - 1/3)*100 if np.isfinite(t) else np.nan for t in thirds ]
 
     rows = [
-        dict(項目="顔の縦/横 (H/W)", 写真値=round(face_ar,3), 理想値=f"{target_name}={round(target_ratio,3)}", 差分%=round(err_ar,2)),
-        dict(項目="上段（髪際→眉）/全高", 写真値=round(thirds[0],3), 理想値="1/3", 差分%=round(thirds_err[0],2)),
-        dict(項目="中段（眉→鼻）/全高",   写真値=round(thirds[1],3), 理想値="1/3", 差分%=round(thirds_err[1],2)),
-        dict(項目="下段（鼻→顎）/全高",   写真値=round(thirds[2],3), 理想値="1/3", 差分%=round(thirds_err[2],2)),
-        dict(項目="目間隔/片目幅",        写真値=round(metrics["eye_spacing_ratio"],3), 理想値="参考: ≈1.0", 差分%=None),
-        dict(項目="鼻幅/口幅",            写真値=round(metrics["nose_to_mouth"],3),   理想値="参考: 個人差", 差分%=None),
+        {"項目":"顔の縦/横 (H/W)", "写真値":round(face_ar,3), "理想値":f"{target_name}={round(target_ratio,3)}", "差分%":round(err_ar,2)},
+        {"項目":"上段（髪際→眉）/全高", "写真値":round(thirds[0],3), "理想値":"1/3", "差分%":round(thirds_err[0],2)},
+        {"項目":"中段（眉→鼻）/全高",   "写真値":round(thirds[1],3), "理想値":"1/3", "差分%":round(thirds_err[1],2)},
+        {"項目":"下段（鼻→顎）/全高",   "写真値":round(thirds[2],3), "理想値":"1/3", "差分%":round(thirds_err[2],2)},
+        {"項目":"目間隔/片目幅",        "写真値":round(metrics["eye_spacing_ratio"],3), "理想値":"参考: ≈1.0", "差分%":None},
+        {"項目":"鼻幅/口幅",            "写真値":round(metrics["nose_to_mouth"],3),   "理想値":"参考: 個人差", "差分%":None},
     ]
     return pd.DataFrame(rows)
 
