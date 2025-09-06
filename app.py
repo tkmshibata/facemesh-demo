@@ -6,6 +6,7 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 import mediapipe as mp
+from mediapipe.framework.formats import landmark_pb2 as mp_landmark
 
 # ===================== ページ設定 & UI微調整 =====================
 st.set_page_config(page_title="ランドマーク検出 × 黄金比/白銀比", page_icon="📐", layout="centered")
@@ -142,11 +143,15 @@ def draw_overlay(image_rgb: np.ndarray, xy: np.ndarray, metrics: Dict[str, float
     h, w, _ = annotated.shape
 
     # 1) ランドマークの薄い描画
+    nl = mp_landmark.NormalizedLandmarkList(
+        landmark=[
+            mp_landmark.NormalizedLandmark(x=float(x)/w, y=float(y)/h)
+            for (x, y) in xy
+        ]
+    )
     mp_draw.draw_landmarks(
         annotated,
-        mp.framework.formats.landmark_pb2.NormalizedLandmarkList(landmark=[
-            mp.framework.formats.landmark_pb2.NormalizedLandmark(x=float(x)/w, y=float(y)/h) for (x,y) in xy
-        ]),
+        nl,
         mp_face.FACEMESH_TESSELATION,
         landmark_drawing_spec=None,
         connection_drawing_spec=mp_draw.DrawingSpec(color=(200,200,200), thickness=1, circle_radius=0)
