@@ -5,7 +5,14 @@ import mediapipe as mp
 from PIL import Image
 
 st.set_page_config(page_title="Custom FaceMesh", layout="centered")
-st.title("ランドマーク検出")
+hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}     /* 右上の「≡」メニュー */
+    footer {visibility: hidden;}       /* 下部の「Made with Streamlit」ロゴ */
+    header {visibility: hidden;}       /* 上部のヘッダー */
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # ★ モジュールエイリアスを用意しておくと参照しやすい
 mp_face = mp.solutions.face_mesh
