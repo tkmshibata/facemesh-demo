@@ -24,7 +24,7 @@ except Exception as e:
 # ========= ページ設定 & UI最小化 =========
 st.set_page_config(page_title="顔 × 黄金比/白銀比（三分割）", page_icon="📐", layout="centered")
 st.markdown("<style>#MainMenu,header,footer{visibility:hidden;}</style>", unsafe_allow_html=True)
-st.title("ランドマーク検出 × 黄金比 / 白銀比（眉↔鼻下を基準に三分割）")
+st.title("ランドマーク検出 × 黄金比 / 白銀比")
 
 # ========= MediaPipe（キャッシュ） =========
 @st.cache_resource
