@@ -1,13 +1,29 @@
 import math
 from typing import Dict, Tuple, List
 
-import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
 import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2 as mp_landmark
 import pandas as pd
+
+# ================= OpenCVを安全に遅延インポート =================
+try:
+    import cv2
+except Exception as e:
+    st.set_page_config(page_title="起動エラー", page_icon="⚠️", layout="centered")
+    st.error(
+        "OpenCV(cv2)の読み込みに失敗しました。\n\n"
+        "【解決策】\n"
+        "- requirements.txt を以下に揃えてください：\n"
+        "  opencv-python-headless==4.11.0.86\n"
+        "  protobuf<5\n"
+        "  attrs<24\n"
+        "  numpy==1.26.4\n"
+    )
+    st.exception(e)
+    st.stop()
 
 # ================= ページ設定 & UI最小化 =================
 st.set_page_config(page_title="顔 × 黄金比/白銀比（三分割）", page_icon="📐", layout="centered")
@@ -36,7 +52,7 @@ SILVER = 2 ** 0.5               # 1.414...
 IDX = dict(
     R_E_OUT=33, R_E_IN=133, L_E_IN=362, L_E_OUT=263,  # 目
     M_R=61, M_L=291,                                  # 口角
-    NOSE_L=97, NOSE_R=326,                            # 鼻翼端（鼻下近似に利用）
+    NOSE_L=97, NOSE_R=326,                            # 鼻翼端
     CHIN=152,                                         # 顎先
     BROW_R_UP=105, BROW_L_UP=334                      # 眉上の代表点
 )
@@ -82,45 +98,6 @@ def align_rotate(img_rgb: np.ndarray, xy: np.ndarray) -> Tuple[np.ndarray, np.nd
     xy_rot = (M @ xy_h.T).T
     return rot, xy_rot
 
-def compute_keylines_from_rotated(xy_rot: np.ndarray) -> Dict[str, float]:
-    """回転後の座標から、三分割用キーポイント y を算出。"""
-    brow_y = (xy_rot[IDX["BROW_R_UP"]][1] + xy_rot[IDX["BROW_L_UP"]][1]) / 2.0
-    nose_base_y = (xy_rot[IDX["NOSE_L"]][1] + xy_rot[IDX["NOSE_R"]][1]) / 2.0
-    chin_y = xy_rot[IDX["CHIN"]][1]
-    oval = face_oval_indices()
-    hairline_y = float(np.min(xy_rot[oval][:, 1]))  # 生え際近似：外輪郭の最上
-    return dict(brow_y=brow_y, nose_base_y=nose_base_y, chin_y=chin_y, hairline_y=hairline_y)
-
-def compute_crop_box(xy_rot: np.ndarray, img_shape, key: Dict[str, float], extra_margin=0.18) -> Tuple[int,int,int,int]:
-    """顔外輪郭と“理想線（生え際=眉-1, 顎=鼻下+1）”が入るようにトリミング範囲を決定。"""
-    h, w = img_shape[:2]
-    oval = face_oval_indices()
-    pts = xy_rot[oval]
-    x1, y1 = float(np.min(pts[:,0])), float(np.min(pts[:,1]))
-    x2, y2 = float(np.max(pts[:,0])), float(np.max(pts[:,1]))
-
-    base = key["nose_base_y"] - key["brow_y"]      # 眉→鼻下（基準=1）
-    ideal_top = key["brow_y"] - base               # 理想の生え際ライン
-    ideal_bottom = key["nose_base_y"] + base       # 理想の顎先ライン
-
-    y1 = min(y1, ideal_top)
-    y2 = max(y2, ideal_bottom)
-
-    bw, bh = (x2 - x1), (y2 - y1)
-    x1 -= bw * extra_margin; x2 += bw * extra_margin
-    y1 -= bh * extra_margin; y2 += bh * extra_margin
-
-    x1i = int(max(0, round(x1))); y1i = int(max(0, round(y1)))
-    x2i = int(min(w-1, round(x2))); y2i = int(min(h-1, round(y2)))
-    return x1i, y1i, x2i, y2i
-
-def crop_with_box(img_rot: np.ndarray, xy_rot: np.ndarray, box: Tuple[int,int,int,int]) -> Tuple[np.ndarray, np.ndarray]:
-    x1,y1,x2,y2 = box
-    crop = img_rot[y1:y2, x1:x2].copy()
-    xy_crop = xy_rot.copy()
-    xy_crop[:,0] -= x1; xy_crop[:,1] -= y1
-    return crop, xy_crop
-
 # ================= 指標（切り出し後に計算） =================
 def compute_metrics_on_crop(xy: np.ndarray) -> Dict[str, float]:
     oval = face_oval_indices()
@@ -147,7 +124,7 @@ def compute_metrics_on_crop(xy: np.ndarray) -> Dict[str, float]:
     re_c = (xy[IDX["R_E_OUT"]] + xy[IDX["R_E_IN"]]) / 2.0
     le_c = (xy[IDX["L_E_OUT"]] + xy[IDX["L_E_IN"]]) / 2.0
     interocular = dist(re_c, le_c)
-    eye_spacing_ratio = interocular / eye_w if eye_w>1e-6 else np.nan  # 理想=1
+    eye_spacing_ratio = interocular / eye_w if eye_w>1e-6 else np.nan
 
     nose_w = dist(xy[IDX["NOSE_L"]], xy[IDX["NOSE_R"]])
     mouth_w = dist(xy[IDX["M_R"]], xy[IDX["M_L"]])
@@ -159,6 +136,26 @@ def compute_metrics_on_crop(xy: np.ndarray) -> Dict[str, float]:
         L_top=L_top, L_mid=L_mid, L_bot=L_bot,
         eye_spacing_ratio=eye_spacing_ratio, nose_to_mouth=nose_to_mouth
     )
+
+# ================= アプリ本体 =================
+uploaded = st.file_uploader("画像をアップロード（JPG/PNG）", type=["jpg","jpeg","png"])
+if not uploaded:
+    st.stop()
+
+img = Image.open(uploaded).convert("RGB")
+np_img = pil2np(img)
+
+# 処理負荷と見た目のバランスで、元画像が大きすぎる場合は先に縮小
+long_edge = max(np_img.shape[:2])
+if long_edge > 1800:
+    scale0 = 1800 / long_edge
+    np_img = cv2.resize(np_img, (int(np_img.shape[1]*scale0), int(np_img.shape[0]*scale0)), interpolation=cv2.INTER_AREA)
+
+# FaceMesh
+res = face_mesh.process(np_img)
+if not res.multi_face_landmarks:
+    st.error("顔を検出できませんでした。正面に近い・明るい画像でお試しください。")
+    st.stop()
 
 # ================= オーバーレイ（描画はすべてクロップ後） =================
 def build_overlay(crop: np.ndarray, xy: np.ndarray, target_ratio: float, label: str) -> np.ndarray:
