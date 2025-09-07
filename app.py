@@ -8,29 +8,25 @@ import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2 as mp_landmark
 import pandas as pd
 
-# ================= OpenCVを安全に遅延インポート =================
+# ========= OpenCV を安全に遅延インポート（失敗時はUIで停止） =========
 try:
     import cv2
 except Exception as e:
     st.set_page_config(page_title="起動エラー", page_icon="⚠️", layout="centered")
     st.error(
-        "OpenCV(cv2)の読み込みに失敗しました。\n\n"
-        "【解決策】\n"
-        "- requirements.txt を以下に揃えてください：\n"
-        "  opencv-python-headless==4.11.0.86\n"
-        "  protobuf<5\n"
-        "  attrs<24\n"
-        "  numpy==1.26.4\n"
+        "OpenCV(cv2) の読み込みに失敗しました。\n\n"
+        "requirements.txt が以下になっているか確認してください：\n"
+        "  opencv-python-headless==4.11.0.86 / protobuf<5 / attrs<24 / numpy==1.26.4"
     )
     st.exception(e)
     st.stop()
 
-# ================= ページ設定 & UI最小化 =================
+# ========= ページ設定 & UI最小化 =========
 st.set_page_config(page_title="顔 × 黄金比/白銀比（三分割）", page_icon="📐", layout="centered")
 st.markdown("<style>#MainMenu,header,footer{visibility:hidden;}</style>", unsafe_allow_html=True)
 st.title("ランドマーク検出 × 黄金比 / 白銀比（眉↔鼻下を基準に三分割）")
 
-# ================= MediaPipe（キャッシュ） =================
+# ========= MediaPipe（キャッシュ） =========
 @st.cache_resource
 def get_facemesh():
     return mp.solutions.face_mesh.FaceMesh(
@@ -44,11 +40,11 @@ mp_face = mp.solutions.face_mesh
 mp_draw = mp.solutions.drawing_utils
 face_mesh = get_facemesh()
 
-# ================= 定数・ユーティリティ =================
+# ========= 定数・ユーティリティ =========
 PHI = (1 + 5 ** 0.5) / 2.0      # 1.618...
 SILVER = 2 ** 0.5               # 1.414...
 
-# よく使うランドマーク index
+# ランドマーク index
 IDX = dict(
     R_E_OUT=33, R_E_IN=133, L_E_IN=362, L_E_OUT=263,  # 目
     M_R=61, M_L=291,                                  # 口角
@@ -81,7 +77,7 @@ def dashed_line(img, pt1, pt2, color, thickness=2, dash=12, gap=8):
         e = p1 + ((dash + gap) * i + dash) * v
         cv2.line(img, tuple(s.astype(int)), tuple(e.astype(int)), color, thickness, lineType=cv2.LINE_AA)
 
-# ================= 整列（目の水平化）& 切り出し =================
+# ========= 整列（目の水平化）& 切り出し =========
 def align_rotate(img_rgb: np.ndarray, xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """目の中心線が水平になるよう回転。画像と点群を回転。"""
     h, w, _ = img_rgb.shape
@@ -98,7 +94,46 @@ def align_rotate(img_rgb: np.ndarray, xy: np.ndarray) -> Tuple[np.ndarray, np.nd
     xy_rot = (M @ xy_h.T).T
     return rot, xy_rot
 
-# ================= 指標（切り出し後に計算） =================
+def compute_keylines_from_rotated(xy_rot: np.ndarray) -> Dict[str, float]:
+    """回転後の座標から、三分割用キーポイント y を算出。"""
+    brow_y = (xy_rot[IDX["BROW_R_UP"]][1] + xy_rot[IDX["BROW_L_UP"]][1]) / 2.0
+    nose_base_y = (xy_rot[IDX["NOSE_L"]][1] + xy_rot[IDX["NOSE_R"]][1]) / 2.0
+    chin_y = xy_rot[IDX["CHIN"]][1]
+    oval = face_oval_indices()
+    hairline_y = float(np.min(xy_rot[oval][:, 1]))  # 生え際近似：外輪郭の最上
+    return dict(brow_y=brow_y, nose_base_y=nose_base_y, chin_y=chin_y, hairline_y=hairline_y)
+
+def compute_crop_box(xy_rot: np.ndarray, img_shape, key: Dict[str, float], extra_margin=0.18) -> Tuple[int,int,int,int]:
+    """顔外輪郭と“理想線（生え際=眉-1, 顎=鼻下+1）”が入るようにトリミング範囲を決定。"""
+    h, w = img_shape[:2]
+    oval = face_oval_indices()
+    pts = xy_rot[oval]
+    x1, y1 = float(np.min(pts[:,0])), float(np.min(pts[:,1]))
+    x2, y2 = float(np.max(pts[:,0])), float(np.max(pts[:,1]))
+
+    base = key["nose_base_y"] - key["brow_y"]      # 眉→鼻下（基準=1）
+    ideal_top = key["brow_y"] - base               # 理想の生え際ライン
+    ideal_bottom = key["nose_base_y"] + base       # 理想の顎先ライン
+
+    y1 = min(y1, ideal_top)
+    y2 = max(y2, ideal_bottom)
+
+    bw, bh = (x2 - x1), (y2 - y1)
+    x1 -= bw * extra_margin; x2 += bw * extra_margin
+    y1 -= bh * extra_margin; y2 += bh * extra_margin
+
+    x1i = int(max(0, round(x1))); y1i = int(max(0, round(y1)))
+    x2i = int(min(w-1, round(x2))); y2i = int(min(h-1, round(y2)))
+    return x1i, y1i, x2i, y2i
+
+def crop_with_box(img_rot: np.ndarray, xy_rot: np.ndarray, box: Tuple[int,int,int,int]) -> Tuple[np.ndarray, np.ndarray]:
+    x1,y1,x2,y2 = box
+    crop = img_rot[y1:y2, x1:x2].copy()
+    xy_crop = xy_rot.copy()
+    xy_crop[:,0] -= x1; xy_crop[:,1] -= y1
+    return crop, xy_crop
+
+# ========= 指標（切り出し後に計算） =========
 def compute_metrics_on_crop(xy: np.ndarray) -> Dict[str, float]:
     oval = face_oval_indices()
     pts = xy[oval]
@@ -124,7 +159,7 @@ def compute_metrics_on_crop(xy: np.ndarray) -> Dict[str, float]:
     re_c = (xy[IDX["R_E_OUT"]] + xy[IDX["R_E_IN"]]) / 2.0
     le_c = (xy[IDX["L_E_OUT"]] + xy[IDX["L_E_IN"]]) / 2.0
     interocular = dist(re_c, le_c)
-    eye_spacing_ratio = interocular / eye_w if eye_w>1e-6 else np.nan
+    eye_spacing_ratio = interocular / eye_w if eye_w>1e-6 else np.nan  # 理想=1
 
     nose_w = dist(xy[IDX["NOSE_L"]], xy[IDX["NOSE_R"]])
     mouth_w = dist(xy[IDX["M_R"]], xy[IDX["M_L"]])
@@ -137,27 +172,7 @@ def compute_metrics_on_crop(xy: np.ndarray) -> Dict[str, float]:
         eye_spacing_ratio=eye_spacing_ratio, nose_to_mouth=nose_to_mouth
     )
 
-# ================= アプリ本体 =================
-uploaded = st.file_uploader("画像をアップロード（JPG/PNG）", type=["jpg","jpeg","png"])
-if not uploaded:
-    st.stop()
-
-img = Image.open(uploaded).convert("RGB")
-np_img = pil2np(img)
-
-# 処理負荷と見た目のバランスで、元画像が大きすぎる場合は先に縮小
-long_edge = max(np_img.shape[:2])
-if long_edge > 1800:
-    scale0 = 1800 / long_edge
-    np_img = cv2.resize(np_img, (int(np_img.shape[1]*scale0), int(np_img.shape[0]*scale0)), interpolation=cv2.INTER_AREA)
-
-# FaceMesh
-res = face_mesh.process(np_img)
-if not res.multi_face_landmarks:
-    st.error("顔を検出できませんでした。正面に近い・明るい画像でお試しください。")
-    st.stop()
-
-# ================= オーバーレイ（描画はすべてクロップ後） =================
+# ========= オーバーレイ（描画はすべてクロップ後） =========
 def build_overlay(crop: np.ndarray, xy: np.ndarray, target_ratio: float, label: str) -> np.ndarray:
     """黄金/白銀の枠 + 三分割（理想1:1:1 & 実測端）を描画。すべて AA で描く。"""
     out = crop.copy()
@@ -221,7 +236,7 @@ def build_overlay(crop: np.ndarray, xy: np.ndarray, target_ratio: float, label: 
 
     return out
 
-# ================= テーブル（比率） =================
+# ========= テーブル（比率） =========
 def build_table(metrics: Dict[str,float], target_ratio: float, target_name: str) -> pd.DataFrame:
     # 顔 H/W と φ/√2 の誤差
     face_ar = metrics["face_AR"]
@@ -262,8 +277,12 @@ def build_table(metrics: Dict[str,float], target_ratio: float, target_name: str)
     ]
     return pd.DataFrame(rows)
 
-# ================= アプリ本体 =================
-uploaded = st.file_uploader("画像をアップロード（JPG/PNG）", type=["jpg","jpeg","png"])
+# ========= アプリ本体（※ ウィジェットはここだけ・必ず key を付与） =========
+uploaded = st.file_uploader(
+    "画像をアップロード（JPG/PNG）",
+    type=["jpg","jpeg","png"],
+    key="image_file"
+)
 if not uploaded:
     st.stop()
 
@@ -297,11 +316,10 @@ box = compute_crop_box(xy_rot, rot_img.shape, keys, extra_margin=0.18)
 crop, xy_crop = crop_with_box(rot_img, xy_rot, box)
 
 # 4) 表示用に先に拡大（拡大後に描画→等倍表示でギザギザ防止）
-TARGET_DISPLAY_WIDTH = 900  # 仕上がりの横幅（好みで）
+TARGET_DISPLAY_WIDTH = 900  # 仕上がりの横幅（必要に応じて調整）
 scale_disp = TARGET_DISPLAY_WIDTH / crop.shape[1]
 if scale_disp < 1.0:
-    # 縮小は線が細くなるので避け、等倍で描画する
-    scale_disp = 1.0
+    scale_disp = 1.0  # 縮小は線が細くなるので避ける
 
 disp_img = cv2.resize(
     crop,
@@ -317,15 +335,21 @@ metrics = compute_metrics_on_crop(disp_xy)
 img_golden = build_overlay(disp_img, disp_xy, PHI, "GOLDEN")
 img_silver = build_overlay(disp_img, disp_xy, SILVER, "SILVER")
 
-# 7) 切替 UI（画像と表が同期）
-mode = st.segmented_control("比較対象（画像・表ともに切替）", options=["黄金比", "白銀比"], default="黄金比")
+# 7) 切替 UI（画像と表が同期） ※ key を必ず付ける
+mode = st.segmented_control(
+    "比較対象（画像・表ともに切替）",
+    options=["黄金比", "白銀比"],
+    default="黄金比",
+    key="ratio_selector"
+)
+
 if mode == "黄金比":
     target_ratio, target_name, show_img = PHI, "φ", img_golden
 else:
     target_ratio, target_name, show_img = SILVER, "√2", img_silver
 
 st.subheader("結果オーバーレイ（回転補正 & 切り出し後 / 拡大後に描画）")
-# 等倍で表示（ブラウザ側の拡縮を避ける）
+# 等倍で表示（ブラウザ側の非整数拡縮を避ける）
 st.image(Image.fromarray(show_img), use_container_width=False, width=show_img.shape[1])
 
 st.subheader("比率の比較表")
